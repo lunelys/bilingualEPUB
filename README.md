@@ -6,7 +6,7 @@
 
 ---
 
-## 2 Learning Modes
+## Two Learning Modes
 
 ### 1. `EN ➔ DE` Mode 1: English Books (`Progressive German Weave`)
 * **Progressive Ramp-Up:** Unlocks **5 to 30 new German words per chapter** (default: `10`), chosen from B1/B2/C1 words that actually appear in that chapter.
