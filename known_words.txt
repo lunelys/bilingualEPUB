@@ -1,0 +1,2 @@
+# Add any German or English words you already know by heart (one per line).
+# They will never be translated in future books.

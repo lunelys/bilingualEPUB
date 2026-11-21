@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+bilingual_kobo.py
+
+# Ignore personal / copyrighted EPUBs in the root folder or input folders
+/*.epub
+*[Zz]-[Ll]ibrary*.epub
+*1lib.sk*.epub
+*z-lib.sk*.epub
+
+# Ignore generated output files by default (keep folder structure via .gitkeep)
+Output_English_Augmented/*
+!Output_English_Augmented/.gitkeep
+Output_German_Augmented/*
+!Output_German_Augmented/.gitkeep
