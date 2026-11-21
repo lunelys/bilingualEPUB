@@ -6,7 +6,7 @@
 
 ---
 
-## ✨ Two Learning Modes
+## 2 Learning Modes
 
 ### 1. `EN ➔ DE` Mode 1: English Books (`Progressive German Weave`)
 * **Progressive Ramp-Up:** Unlocks **5 to 30 new German words per chapter** (default: `10`), chosen from B1/B2/C1 words that actually appear in that chapter.
@@ -43,7 +43,7 @@ bilingualEPUB/
 
 ---
 
-## 🚀 Quick Start (Windows, macOS & Linux)
+## Quick Start (Windows, macOS & Linux)
 
 1. **Zero Dependencies:** Uses only Python 3's standard library—works out of the box on **Windows, macOS, and Linux**.
 2. **Launch the UI:**
