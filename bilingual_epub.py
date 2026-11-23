@@ -1,20 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-bilingualEPUB Core Engine & CLI/UI Backend (v5)
+bilingualEPUB Core Engine & CLI/UI Backend (v6)
 ===============================================
-Updates in v5:
-1. Clean `word : translation` .txt format (no headers, no numbering, no chapter dividers)
-   ready to feed directly into external flashcard/learning tools:
-       das Gewehr : rifle
-       stürzte : collapsed, fell
-2. Configurable `words_per_txt_list` (10..100, default 50) and `max_thematic_lists` (1..8, default 4).
-3. `user_level` ("B1", "B2", "C1") piped to BOTH Mode 1 (EN -> DE) and Mode 2 (DE -> DE+).
+Key Features & Fixes in v6:
+1. True EPUB <spine> Reading Order + Natural Sorting:
+   - Parses the EPUB's `.opf` `<manifest>` and `<spine>` to process chapters in the exact
+     page-1-to-end reading order (never processing Chapter 10 before Chapter 2!).
+2. Bulletproof Single-Tag HTML Walker:
+   - Splits HTML only on individual tags `<[^>]+>` and entities `&...;`, tracking a
+     `skip_depth` counter for `<head>`, `<style>`, `<script>`, `<title>`, `<svg>`, and `<h1..h6>`.
+   - Works on all EPUB structures (`<p>`, `<P>`, `<div>`, `<span>`, `<blockquote>`, `<section>`)
+     and can never be tripped up by self-closing `<svg/>` ornaments.
+3. Even Chapter Slice Distribution & Guaranteed Toolbox-to-Inline Match:
+   - Uses the exact same walker for candidate discovery and replacement so 100% of words
+     shown in a chapter's toolbox are guaranteed to appear with inline translations in that chapter,
+     distributed evenly starting from Page 1.
 """
 
 import zipfile
 import re
 import difflib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from collections import Counter
 from vocab_data import (
     EN_TO_DE_VOCAB,
@@ -39,35 +45,22 @@ NOUN_PRECEDERS = {
     "dark", "black", "white", "red", "blue", "cold", "warm", "deep", "long", "short",
     "heavy", "sharp", "soft", "bare", "empty", "full", "own", "other", "another",
     "first", "last", "next", "old", "new", "young", "little", "small", "great", "good",
+    "sudden", "faint", "loud", "quiet", "silent", "single", "final", "quick", "slow",
 }
 
 AMBIGUOUS_EN_NOUNS = {
-    "light", "lights", "mind", "minds", "hand", "hands", "face", "faces",
-    "head", "heads", "arm", "arms", "shoulder", "shoulders", "back", "backs",
-    "step", "steps", "footstep", "footsteps", "turn", "turns", "look", "looks",
-    "glance", "glances", "gaze", "gazes", "smile", "smiles", "whisper", "whispers",
-    "scream", "screams", "sigh", "sighs", "groan", "groans", "fight", "fights",
-    "attack", "attacks", "escape", "escapes", "rescue", "rescues", "test", "tests",
-    "order", "orders", "rule", "rules", "plan", "plans", "force", "forces",
-    "power", "powers", "place", "places", "room", "rooms", "water", "fire", "fires",
-    "rain", "snow", "wind", "storm", "dust", "smoke", "blood", "sweat", "tear", "tears",
-    "wound", "wounds", "scar", "scars", "fear", "fears", "dread", "panic", "hate",
-    "love", "hope", "hopes", "trust", "doubt", "doubts", "dream", "dreams", "sleep",
-    "promise", "promises", "lie", "lies", "question", "questions", "answer", "answers",
-    "name", "names", "word", "words", "sign", "signs", "mark", "marks", "lock", "locks",
-    "trap", "traps", "target", "targets", "guard", "guards", "master", "masters",
-    "camp", "camps", "base", "bases", "corner", "corners", "edge", "edges",
-    "bridge", "mirror", "mirrors", "book", "books", "page", "pages", "map", "maps",
-    "picture", "pictures", "image", "images", "ring", "rings", "coat", "coats",
-    "dress", "dresses", "shield", "shields", "poison", "poisons", "taste", "smell",
-    "scent", "sound", "sounds", "noise", "silence", "touch", "sense", "senses",
-    "feeling", "feelings", "thought", "thoughts", "memory", "memories",
-    "choice", "end", "ends", "beginning", "gift", "gifts", "rock", "rocks",
-    "stone", "stones", "ground", "land", "earth", "supply", "supplies", "exchange",
-    "hint", "hints", "strap", "straps", "regret", "regrets", "curse", "curses",
-    "attempt", "attempts", "challenge", "challenges", "access", "trigger", "triggers",
-    "decoy", "circle", "circles", "detail", "details", "desire", "pressure",
-    "wave", "waves", "stream", "streams", "spark", "sparks", "bruise", "bruises",
+    "light", "lights", "hand", "hands", "face", "faces", "head", "heads",
+    "arm", "arms", "back", "backs", "step", "steps", "turn", "turns",
+    "look", "looks", "smile", "smiles", "whisper", "whispers", "scream", "screams",
+    "fight", "fights", "attack", "attacks", "escape", "escapes", "rescue", "rescues",
+    "order", "orders", "force", "forces", "place", "places", "room", "rooms",
+    "water", "fire", "fires", "trust", "doubt", "promise", "promises", "lie", "lies",
+    "mark", "marks", "lock", "locks", "trap", "traps", "guard", "guards",
+    "ring", "rings", "coat", "coats", "dress", "dresses", "shield", "shields",
+    "touch", "sense", "taste", "smell", "sound", "sounds", "attempt", "attempts",
+    "challenge", "challenges", "access", "trigger", "triggers", "circle", "circles",
+    "desire", "pressure", "wave", "waves", "stream", "streams", "spark", "sparks",
+    "bruise", "bruises", "curse", "curses", "regret", "regrets",
 }
 
 BILINGUAL_CSS = """
@@ -103,6 +96,12 @@ BILINGUAL_CSS = """
 }
 """
 
+# Single-tag / entity splitter (never spans across multiple tags)
+TOKEN_SPLIT_RE = re.compile(r'(<[^>]+>|&[a-zA-Z0-9#]+;)')
+SKIP_TAG_OPEN_RE = re.compile(r'^<(h[1-6]|head|style|script|title|svg)\b', flags=re.I)
+SKIP_TAG_CLOSE_RE = re.compile(r'^</(h[1-6]|head|style|script|title|svg)\s*>', flags=re.I)
+BLOCK_BOUNDARY_RE = re.compile(r'^</?(?:p|div|h[1-6]|li|blockquote|section|article|tr|td|br)\b', flags=re.I)
+
 
 def ensure_folders(workspace: Path):
     folders = {
@@ -122,6 +121,10 @@ def clean_book_slug(filename: str) -> str:
     stem = re.sub(r'\s*\[[^\]]*\]', '', stem).strip()
     slug = re.sub(r'[^A-Za-z0-9ÄÖÜäöüß]+', '_', stem).strip('_')
     return slug or "Book"
+
+
+def natural_sort_key(s: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
 
 
 def normalize_for_cognate(s: str) -> str:
@@ -147,10 +150,45 @@ def is_transparent_cognate(de_word: str, en_gloss: str) -> bool:
     return False
 
 
-def strip_tags(html_str: str) -> str:
-    text = re.sub(r'<style[^>]*>.*?</style>', ' ', html_str, flags=re.S)
-    text = re.sub(r'<[^>]+>', ' ', text)
-    return text
+def walk_and_transform_html(raw_html: str, text_transformer) -> str:
+    """
+    Walks an XHTML/HTML document by splitting on single tags `<[^>]+>` and entities `&...;`.
+    Skips text inside `<head>`, `<style>`, `<script>`, `<title>`, `<svg>`, and `<h1..h6>`.
+    Passes `(text_node, rolling_prev_list)` to `text_transformer` for every story text node.
+    """
+    parts = TOKEN_SPLIT_RE.split(raw_html)
+    skip_depth = 0
+    rolling_prev = [""]
+
+    for i in range(len(parts)):
+        part = parts[i]
+        if i % 2 == 1:
+            # Tag or entity
+            if part.startswith("<") and not part.startswith("<!--"):
+                if not part.endswith("/>") and SKIP_TAG_OPEN_RE.match(part):
+                    skip_depth += 1
+                elif SKIP_TAG_CLOSE_RE.match(part):
+                    skip_depth = max(0, skip_depth - 1)
+                if BLOCK_BOUNDARY_RE.match(part):
+                    rolling_prev[0] = ""
+        else:
+            # Text node
+            if skip_depth == 0 and part.strip():
+                parts[i] = text_transformer(part, rolling_prev)
+
+    return "".join(parts)
+
+
+def extract_story_text_nodes(raw_html: str) -> list:
+    """Returns a list of all story text nodes in reading order (excluding head/headings/style)."""
+    nodes = []
+
+    def _collect(text_node, _rolling_prev):
+        nodes.append(text_node)
+        return text_node
+
+    walk_and_transform_html(raw_html, _collect)
+    return nodes
 
 
 def load_known_words(workspace: Path) -> set:
@@ -190,7 +228,6 @@ def level_display_label(user_level: str) -> str:
 
 
 def format_gloss_clean(gloss: str) -> str:
-    """Ensures slashes become clean comma-spaces: 'collapsed/fell' -> 'collapsed, fell'."""
     return re.sub(r'\s*/\s*', ', ', gloss.strip())
 
 
@@ -201,13 +238,6 @@ def write_en_vocab_txt_stacks(
     stack_size: int = 50,
     export_anki: bool = False,
 ) -> list:
-    """
-    Writes .txt files in stacks of `stack_size` words:
-      <BookSlug>_1.txt, <BookSlug>_2.txt, ...
-    Format inside each .txt file (strictly one pair per line, no headers or chapter dividers):
-      das Gewehr : rifle
-      der Blick : gaze
-    """
     stack_size = max(5, min(200, int(stack_size)))
     lists_dir = output_dir / f"{book_slug}_Vocab_Lists"
     lists_dir.mkdir(parents=True, exist_ok=True)
@@ -253,13 +283,6 @@ def write_de_thematic_txt_lists(
     words_per_list: int = 50,
     export_anki: bool = False,
 ) -> list:
-    """
-    For German books: generates up to `max_lists` (1..8) thematic .txt lists
-    of `words_per_list` (10..100) words each.
-    Format inside each .txt file (strictly `word : translation`, one per line):
-      Dolch : dagger
-      stürzte : collapsed, fell
-    """
     max_lists = max(1, min(8, int(max_lists)))
     words_per_list = max(5, min(200, int(words_per_list)))
 
@@ -335,15 +358,90 @@ def write_de_thematic_txt_lists(
     return created_files
 
 
-def detect_story_chapters(namelist: list) -> list:
-    for pattern in (r'c\d+.*\.xhtml$', r'part_\d+\.xhtml$', r'ch(?:ap(?:ter)?)?[_\-]?\d+.*\.x?html$'):
-        matches = sorted([n for n in namelist if re.search(pattern, n, flags=re.I)])
-        if len(matches) >= 3:
-            return matches
-    skip_re = re.compile(r'(cover|toc|nav|copy|title|ack|ded|front|back)', re.I)
-    htmls = sorted([n for n in namelist if n.endswith(('.xhtml', '.html', '.htm'))])
-    filtered = [n for n in htmls if not skip_re.search(Path(n).name)]
-    return filtered if filtered else htmls
+def detect_story_chapters(zin: zipfile.ZipFile) -> list:
+    """
+    Determines the ordered list of story XHTML/HTML chapters in the EPUB:
+    1. First parses the `.opf` `<manifest>` and `<spine>` for exact reading order.
+    2. Filters out tiny frontmatter/backmatter files (cover, toc, nav, copyright).
+    3. Falls back to natural-sorted XHTML/HTML files if no `.opf` spine is found.
+    """
+    namelist = zin.namelist()
+    name_set = set(namelist)
+    skip_re = re.compile(r'^(?:cover|toc|nav|copy(?:right)?|title(?:page)?|ack(?:nowledg[e]?ments)?|ded(?:ication)?|front|back|halftitle|adcard|next[\-_]?reads)\b', re.I)
+
+    spine_files = []
+    opf_files = [n for n in namelist if n.lower().endswith('.opf')]
+    if opf_files:
+        opf_path = opf_files[0]
+        opf_dir = PurePosixPath(opf_path).parent
+        opf_raw = zin.read(opf_path).decode('utf-8', errors='replace')
+
+        # Map manifest id -> resolved archive path
+        id_to_href = {}
+        for item_m in re.finditer(r'<item\b([^>]+)>', opf_raw, flags=re.I):
+            attrs = item_m.group(1)
+            id_m = re.search(r'\bid\s*=\s*["\']([^"\']+)["\']', attrs, flags=re.I)
+            href_m = re.search(r'\bhref\s*=\s*["\']([^"\'#]+)', attrs, flags=re.I)
+            if id_m and href_m:
+                raw_href = href_m.group(1)
+                resolved = str(opf_dir / raw_href) if str(opf_dir) != "." else raw_href
+                # Normalize any ../ segments
+                parts = []
+                for seg in resolved.split('/'):
+                    if seg == '..':
+                        if parts:
+                            parts.pop()
+                    elif seg and seg != '.':
+                        parts.append(seg)
+                norm_path = "/".join(parts)
+                if norm_path in name_set:
+                    id_to_href[id_m.group(1)] = norm_path
+                elif raw_href in name_set:
+                    id_to_href[id_m.group(1)] = raw_href
+
+        for ref_m in re.finditer(r'<itemref\b([^>]+)>', opf_raw, flags=re.I):
+            attrs = ref_m.group(1)
+            idref_m = re.search(r'\bidref\s*=\s*["\']([^"\']+)["\']', attrs, flags=re.I)
+            if idref_m and idref_m.group(1) in id_to_href:
+                p = id_to_href[idref_m.group(1)]
+                if p.lower().endswith(('.xhtml', '.html', '.htm')) and p not in spine_files:
+                    spine_files.append(p)
+
+    candidates = spine_files if len(spine_files) >= 2 else sorted(
+        [n for n in namelist if n.lower().endswith(('.xhtml', '.html', '.htm'))],
+        key=natural_sort_key,
+    )
+
+    # Filter out obvious non-story files (cover, toc, copyright, acknowledgments)
+    story_files = [
+        n for n in candidates
+        if not skip_re.search(PurePosixPath(n).stem)
+    ]
+    return story_files if story_files else candidates
+
+
+def is_valid_en_noun_context(word: str, gender: str, prev_w: str) -> bool:
+    if gender in ("der", "die", "das"):
+        if prev_w in VERB_PRECEDERS:
+            return False
+        if word in AMBIGUOUS_EN_NOUNS and prev_w not in NOUN_PRECEDERS:
+            return False
+    return True
+
+
+def strip_previous_bilingual_markup(raw_html: str) -> str:
+    """If an already-augmented EPUB is re-converted, removes old vocab boxes and hints cleanly."""
+    if 'class="bk-vocab-box"' not in raw_html and 'class="bk-hint"' not in raw_html:
+        return raw_html
+    cleaned = re.sub(
+        r'<div class="bk-vocab-box">\s*<div class="bk-vocab-title">.*?</div>\s*<div class="bk-vocab-list">.*?</div>\s*</div>\s*',
+        '',
+        raw_html,
+        flags=re.S,
+    )
+    cleaned = re.sub(r'\s*<span class="bk-hint">\[[^\]]*\]</span>', '', cleaned)
+    cleaned = re.sub(r'<span class="bk-de-word">(.*?)</span>', r'\1', cleaned)
+    return cleaned
 
 
 def transform_en_to_progressive_de(
@@ -358,10 +456,6 @@ def transform_en_to_progressive_de(
     export_anki: bool = False,
     known_words: set = None,
 ):
-    """
-    Mode 1: Converts an English EPUB into a Progressive German Ramp-Up EPUB
-    filtered by `user_level` ("B1", "B2", "C1"), and generates .txt stacks.
-    """
     words_per_chapter = max(1, min(30, int(words_per_chapter)))
     hint_max_encounters = max(1, min(10, int(hint_max_encounters)))
     words_per_txt_list = max(5, min(200, int(words_per_txt_list)))
@@ -369,26 +463,19 @@ def transform_en_to_progressive_de(
     valid_levels = allowed_levels(user_level)
     lvl_label = level_display_label(user_level)
 
-    primary_pool = [
+    vocab_pool = [
         e for e in EN_TO_DE_VOCAB
-        if e.get("level", "B2") in valid_levels
-        and e["id"].lower() not in known_words
+        if e["id"].lower() not in known_words
         and e["base_de"].lower() not in known_words
     ]
-    if user_level.upper() == "C1":
-        fallback_pool = [
-            e for e in EN_TO_DE_VOCAB
-            if e.get("level", "B2") == "B2"
-            and e["id"].lower() not in known_words
-            and e["base_de"].lower() not in known_words
-        ]
-    else:
-        fallback_pool = []
-    vocab_pool = primary_pool + fallback_pool
+    form_to_cand = {}
+    for entry in vocab_pool:
+        for en_f, de_f in entry["forms"].items():
+            if en_f not in form_to_cand:
+                form_to_cand[en_f] = (entry, de_f)
 
     with zipfile.ZipFile(input_epub, 'r') as zin:
-        namelist = zin.namelist()
-        chapter_files = detect_story_chapters(namelist)
+        chapter_files = detect_story_chapters(zin)
 
         unlocked_ids = set()
         unlocked_base_de = set()
@@ -398,27 +485,71 @@ def transform_en_to_progressive_de(
         transformed_files = {}
 
         for ch_idx, ch_path in enumerate(chapter_files, start=1):
-            raw_html = zin.read(ch_path).decode('utf-8', errors='replace')
-            plain_text = strip_tags(raw_html)
+            raw_html = strip_previous_bilingual_markup(
+                zin.read(ch_path).decode('utf-8', errors='replace')
+            )
 
-            tokens = re.findall(r'\b[a-z]{3,}\b', plain_text)
-            token_counts = Counter(tokens)
+            # PASS 1: Walk exact story text nodes to discover candidate words in this chapter
+            valid_counts = Counter()
+            first_pos = {}
+            token_cursor = [0]
 
-            candidates = []
-            seen_cand_base_de = set()
+            def _discover_node(text_node: str, rolling_prev: list) -> str:
+                for m in re.finditer(r"(?<![A-Za-z\-’'])([a-z]{3,})(?![A-Za-z\-’'])", text_node):
+                    w = m.group(1)
+                    prefix = text_node[:m.start()]
+                    prev_words = re.findall(r"[A-Za-z]+", prefix)
+                    prev_w = prev_words[-1].lower() if prev_words else rolling_prev[0]
+                    token_cursor[0] += 1
+
+                    if w in form_to_cand:
+                        entry, _ = form_to_cand[w]
+                        eid = entry["id"]
+                        bde = entry["base_de"]
+                        if eid not in unlocked_ids and bde not in unlocked_base_de:
+                            if is_valid_en_noun_context(w, entry["gender"], prev_w):
+                                valid_counts[eid] += 1
+                                if eid not in first_pos:
+                                    first_pos[eid] = token_cursor[0]
+
+                tail_words = re.findall(r"[A-Za-z]+", text_node)
+                if tail_words:
+                    rolling_prev[0] = tail_words[-1].lower()
+                return text_node
+
+            walk_and_transform_html(raw_html, _discover_node)
+
+            # Skip chapters that have practically no story text (e.g. a full-page illustration)
+            if token_cursor[0] < 15 and not valid_counts:
+                transformed_files[ch_path] = raw_html.encode('utf-8')
+                continue
+
+            avail_entries = []
+            seen_bde = set()
             for entry in vocab_pool:
                 eid = entry["id"]
                 bde = entry["base_de"]
-                if eid in unlocked_ids or bde in unlocked_base_de or bde in seen_cand_base_de:
+                if eid in unlocked_ids or bde in unlocked_base_de or bde in seen_bde:
                     continue
-                freq = sum(token_counts[f] for f in entry["forms"])
-                if freq >= 1:
-                    seen_cand_base_de.add(bde)
+                if valid_counts[eid] >= 1:
+                    seen_bde.add(bde)
                     is_primary = 1 if entry.get("level", "B2") in valid_levels else 0
-                    candidates.append((is_primary, freq, entry))
+                    avail_entries.append((first_pos[eid], is_primary, valid_counts[eid], entry))
 
-            candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            newly_unlocked = [entry for _, _, entry in candidates[:words_per_chapter]]
+            # Sort by first appearance in the chapter and pick evenly across slices
+            avail_entries.sort(key=lambda x: x[0])
+            newly_unlocked = []
+            if len(avail_entries) <= words_per_chapter:
+                newly_unlocked = [x[3] for x in avail_entries]
+            else:
+                n_avail = len(avail_entries)
+                for s_i in range(words_per_chapter):
+                    start_i = (s_i * n_avail) // words_per_chapter
+                    end_i = ((s_i + 1) * n_avail) // words_per_chapter
+                    slice_cands = avail_entries[start_i:end_i]
+                    if slice_cands:
+                        best = max(slice_cands, key=lambda x: (x[1], x[2], -x[0]))
+                        newly_unlocked.append(best[3])
 
             for entry in newly_unlocked:
                 unlocked_ids.add(entry["id"])
@@ -435,8 +566,9 @@ def transform_en_to_progressive_de(
             else:
                 word_pattern = None
 
-            def replace_in_text_node(text_node: str) -> str:
-                if not word_pattern or not text_node.strip():
+            # PASS 2: Walk the exact same story text nodes and perform inline replacements
+            def _replace_node(text_node: str, rolling_prev: list) -> str:
+                if not word_pattern:
                     return text_node
 
                 def _repl(match):
@@ -448,40 +580,38 @@ def transform_en_to_progressive_de(
                     gender = entry["gender"]
 
                     prefix = text_node[:match.start()]
-                    prev_words = re.findall(r"[A-Za-z']+", prefix)
-                    prev_w = prev_words[-1].lower().rstrip("'") if prev_words else ""
+                    prev_words = re.findall(r"[A-Za-z]+", prefix)
+                    prev_w = prev_words[-1].lower() if prev_words else rolling_prev[0]
 
-                    if gender in ("der", "die", "das"):
-                        if prev_w in VERB_PRECEDERS:
-                            return word
-                        if word in AMBIGUOUS_EN_NOUNS and prev_w not in NOUN_PRECEDERS:
-                            return word
+                    if not is_valid_en_noun_context(word, gender, prev_w):
+                        return word
 
                     encounter_counts[eid] += 1
                     cnt = encounter_counts[eid]
 
-                    if cnt <= hint_max_encounters and not is_transparent_cognate(de_form, word):
+                    if cnt <= hint_max_encounters:
                         return f'<span class="bk-de-word">{de_form}</span> <span class="bk-hint">[{format_gloss_clean(entry["meaning"])}]</span>'
                     else:
                         return f'<span class="bk-de-word">{de_form}</span>'
 
-                return word_pattern.sub(_repl, text_node)
+                out = word_pattern.sub(_repl, text_node)
+                tail_words = re.findall(r"[A-Za-z]+", text_node)
+                if tail_words:
+                    rolling_prev[0] = tail_words[-1].lower()
+                return out
 
-            def process_paragraph(p_match):
-                p_open = p_match.group(1)
-                p_inner = p_match.group(2)
-                p_close = p_match.group(3)
-                parts = re.split(r'(<[^>]+>|&[a-zA-Z0-9#]+;)', p_inner)
-                for i in range(0, len(parts), 2):
-                    parts[i] = replace_in_text_node(parts[i])
-                return p_open + "".join(parts) + p_close
+            new_html = walk_and_transform_html(raw_html, _replace_node)
 
-            new_html = re.sub(r'(<p\b[^>]*>)(.*?)(</p>)', process_paragraph, raw_html, flags=re.S)
+            if 'bilingualEPUB Styling' not in new_html and re.search(r'</head>', new_html, flags=re.I):
+                new_html = re.sub(
+                    r'(</head>)',
+                    lambda m: f'<style type="text/css">{BILINGUAL_CSS}</style>{m.group(1)}',
+                    new_html,
+                    count=1,
+                    flags=re.I,
+                )
 
-            if '</head>' in new_html:
-                new_html = new_html.replace('</head>', f'<style type="text/css">{BILINGUAL_CSS}</style></head>', 1)
-
-            new_html = re.sub(r'lang="en(?:-[A-Za-z]+)?"', 'lang="de"', new_html)
+            new_html = re.sub(r'lang="en(?:-[A-Za-z]+)?"', 'lang="de"', new_html, flags=re.I)
 
             if show_chapter_box and newly_unlocked:
                 items_html = " · ".join(
@@ -494,12 +624,12 @@ def transform_en_to_progressive_de(
                     f'<div class="bk-vocab-list">{items_html}</div>'
                     f'</div>'
                 )
-                if '</h1>' in new_html:
-                    new_html = new_html.replace('</h1>', '</h1>\n' + vocab_box_html, 1)
-                elif '</h2>' in new_html:
-                    new_html = new_html.replace('</h2>', '</h2>\n' + vocab_box_html, 1)
-                elif '<body' in new_html:
-                    new_html = re.sub(r'(<body[^>]*>)', r'\1\n' + vocab_box_html, new_html, count=1)
+                if re.search(r'</h1>', new_html, flags=re.I):
+                    new_html = re.sub(r'(</h1>)', lambda m: f'{m.group(1)}\n{vocab_box_html}', new_html, count=1, flags=re.I)
+                elif re.search(r'</h2>', new_html, flags=re.I):
+                    new_html = re.sub(r'(</h2>)', lambda m: f'{m.group(1)}\n{vocab_box_html}', new_html, count=1, flags=re.I)
+                elif re.search(r'<body\b[^>]*>', new_html, flags=re.I):
+                    new_html = re.sub(r'(<body\b[^>]*>)', lambda m: f'{m.group(1)}\n{vocab_box_html}', new_html, count=1, flags=re.I)
 
             transformed_files[ch_path] = new_html.encode('utf-8')
 
@@ -545,7 +675,7 @@ def transform_en_to_progressive_de(
         "txt_files": [p.name for p in txt_files],
         "txt_folder": str(output_epub.parent / f"{book_slug}_Vocab_Lists") if txt_files else "",
     }
-    print(f"[EN -> DE Done] {output_epub.name} | Level {lvl_label} | {result['unlocked_words']} words | {len(txt_files)} .txt files")
+    print(f"[EN -> DE Done] {output_epub.name} | Level {lvl_label} | {result['unlocked_words']} words | {result['total_replacements']} inline replacements")
     return result
 
 
@@ -561,11 +691,6 @@ def transform_de_to_b1_assisted(
     export_anki: bool = False,
     known_words: set = None,
 ):
-    """
-    Mode 2: Takes an original German EPUB, adds fading inline English hints for
-    vocabulary matching `user_level` ("B1" -> B1/B2/C1, "B2" -> B2/C1, "C1" -> C1),
-    and generates up to `max_thematic_lists` thematic .txt lists of `words_per_txt_list` words!
-    """
     max_hints_per_word = max(1, min(10, int(max_hints_per_word)))
     words_per_txt_list = max(5, min(200, int(words_per_txt_list)))
     max_thematic_lists = max(1, min(8, int(max_thematic_lists)))
@@ -605,8 +730,7 @@ def transform_de_to_b1_assisted(
         return None, None, None
 
     with zipfile.ZipFile(input_epub, 'r') as zin:
-        namelist = zin.namelist()
-        chapter_files = detect_story_chapters(namelist)
+        chapter_files = detect_story_chapters(zin)
 
         encounter_counts = Counter()
         matched_words_info = {}
@@ -615,14 +739,13 @@ def transform_de_to_b1_assisted(
         de_word_pattern = re.compile(r'(?<![A-Za-zÄÖÜäöüß\-])([A-Za-zÄÖÜäöüß]{4,})(?![A-Za-zÄÖÜäöüß\-])')
 
         for ch_idx, ch_path in enumerate(chapter_files, start=1):
-            raw_html = zin.read(ch_path).decode('utf-8', errors='replace')
+            raw_html = strip_previous_bilingual_markup(
+                zin.read(ch_path).decode('utf-8', errors='replace')
+            )
             chapter_new_words = []
             chapter_seen_keys = set()
 
-            def gloss_text_node(text_node: str) -> str:
-                if not text_node.strip():
-                    return text_node
-
+            def _gloss_node(text_node: str, _rolling_prev: list) -> str:
                 def _repl(match):
                     word = match.group(1)
                     lemma_key, canon_de, gloss = lookup_de_word(word)
@@ -642,19 +765,16 @@ def transform_de_to_b1_assisted(
 
                 return de_word_pattern.sub(_repl, text_node)
 
-            def process_paragraph(p_match):
-                p_open = p_match.group(1)
-                p_inner = p_match.group(2)
-                p_close = p_match.group(3)
-                parts = re.split(r'(<[^>]+>|&[a-zA-Z0-9#]+;)', p_inner)
-                for i in range(0, len(parts), 2):
-                    parts[i] = gloss_text_node(parts[i])
-                return p_open + "".join(parts) + p_close
+            new_html = walk_and_transform_html(raw_html, _gloss_node)
 
-            new_html = re.sub(r'(<p\b[^>]*>)(.*?)(</p>)', process_paragraph, raw_html, flags=re.S)
-
-            if '</head>' in new_html:
-                new_html = new_html.replace('</head>', f'<style type="text/css">{BILINGUAL_CSS}</style></head>', 1)
+            if 'bilingualEPUB Styling' not in new_html and re.search(r'</head>', new_html, flags=re.I):
+                new_html = re.sub(
+                    r'(</head>)',
+                    lambda m: f'<style type="text/css">{BILINGUAL_CSS}</style>{m.group(1)}',
+                    new_html,
+                    count=1,
+                    flags=re.I,
+                )
 
             if show_chapter_box and chapter_new_words:
                 items_html = " · ".join(f'<b>{w}</b> (<i>{g}</i>)' for w, g in chapter_new_words)
@@ -664,14 +784,14 @@ def transform_de_to_b1_assisted(
                     f'<div class="bk-vocab-list">{items_html}</div>'
                     f'</div>'
                 )
-                if '</h2>' in new_html:
-                    new_html = new_html.replace('</h2>', '</h2>\n' + vocab_box_html, 1)
-                elif '</h3>' in new_html:
-                    new_html = new_html.replace('</h3>', '</h3>\n' + vocab_box_html, 1)
-                elif '</h1>' in new_html:
-                    new_html = new_html.replace('</h1>', '</h1>\n' + vocab_box_html, 1)
-                elif '<body' in new_html:
-                    new_html = re.sub(r'(<body[^>]*>)', r'\1\n' + vocab_box_html, new_html, count=1)
+                if re.search(r'</h2>', new_html, flags=re.I):
+                    new_html = re.sub(r'(</h2>)', lambda m: f'{m.group(1)}\n{vocab_box_html}', new_html, count=1, flags=re.I)
+                elif re.search(r'</h3>', new_html, flags=re.I):
+                    new_html = re.sub(r'(</h3>)', lambda m: f'{m.group(1)}\n{vocab_box_html}', new_html, count=1, flags=re.I)
+                elif re.search(r'</h1>', new_html, flags=re.I):
+                    new_html = re.sub(r'(</h1>)', lambda m: f'{m.group(1)}\n{vocab_box_html}', new_html, count=1, flags=re.I)
+                elif re.search(r'<body\b[^>]*>', new_html, flags=re.I):
+                    new_html = re.sub(r'(<body\b[^>]*>)', lambda m: f'{m.group(1)}\n{vocab_box_html}', new_html, count=1, flags=re.I)
 
             transformed_files[ch_path] = new_html.encode('utf-8')
 
@@ -718,7 +838,7 @@ def transform_de_to_b1_assisted(
         "txt_files": [p.name for p in txt_files],
         "txt_folder": str(output_epub.parent / f"{book_slug}_Vocab_Lists") if txt_files else "",
     }
-    print(f"[DE -> DE+ Done] {output_epub.name} | Level {lvl_label} | {result['unlocked_words']} words | {len(txt_files)} .txt files")
+    print(f"[DE -> DE+ Done] {output_epub.name} | Level {lvl_label} | {result['unlocked_words']} words | {result['total_replacements']} inline hints")
     return result
 
 
