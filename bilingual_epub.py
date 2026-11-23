@@ -25,6 +25,7 @@ from collections import Counter
 from vocab_data import (
     EN_TO_DE_VOCAB,
     DE_HARD_GLOSSES,
+    DE_NOUN_WITH_ARTICLE,
     DE_THEME_KEYWORDS,
     get_de_word_level,
 )
@@ -301,6 +302,7 @@ def write_de_thematic_txt_lists(
         if lemma_key not in matched_words_info:
             continue
         de_disp, gloss = matched_words_info[lemma_key]
+        de_formatted = DE_NOUN_WITH_ARTICLE.get(de_disp, de_disp)
         clean_g = format_gloss_clean(gloss)
         if clean_g in seen_glosses:
             continue
@@ -310,15 +312,16 @@ def write_de_thematic_txt_lists(
         placed = False
         for theme_key, kw_set in DE_THEME_KEYWORDS.items():
             if gloss_tokens & kw_set:
-                themed_buckets[theme_key].append((de_disp, clean_g))
+                themed_buckets[theme_key].append((de_formatted, clean_g))
                 placed = True
                 break
         if not placed:
-            themed_buckets["8_Narrative_&_Modifiers"].append((de_disp, clean_g))
+            themed_buckets["8_Narrative_&_Modifiers"].append((de_formatted, clean_g))
 
+    # Rank the 7 primary thematic buckets by prominence first; keep catch-all 8_Narrative_&_Modifiers last
     ordered_themes = sorted(
         [(k, items) for k, items in themed_buckets.items() if items],
-        key=lambda x: len(x[1]),
+        key=lambda x: (0 if x[0].startswith("8_") else 1, len(x[1])),
         reverse=True,
     )
     chosen_themes = ordered_themes[:max_lists]
@@ -358,16 +361,42 @@ def write_de_thematic_txt_lists(
     return created_files
 
 
+def is_front_or_back_matter_html(raw_html: str) -> bool:
+    """Detects copyright, impressum, or table-of-contents pages by content."""
+    sample = raw_html[:4000].lower()
+    copyright_markers = (
+        "all rights reserved",
+        "library of congress",
+        "alle rechte vorbehalten",
+        "impressum",
+        "urheberrecht",
+        "first published in",
+        "printed in the united states",
+        "printed in great britain",
+    )
+    return any(m in sample for m in copyright_markers)
+
+
 def detect_story_chapters(zin: zipfile.ZipFile) -> list:
     """
     Determines the ordered list of story XHTML/HTML chapters in the EPUB:
     1. First parses the `.opf` `<manifest>` and `<spine>` for exact reading order.
-    2. Filters out tiny frontmatter/backmatter files (cover, toc, nav, copyright).
+    2. Filters out frontmatter/backmatter files (cover, toc, nav, copyright, dedication,
+       epigraph, titlepage, halftitle, map, acknowledgments, about-the-author) even when
+       prefixed by ISBN/publisher strings like `Author_97812345_epub3_cop_r1.xhtml`.
     3. Falls back to natural-sorted XHTML/HTML files if no `.opf` spine is found.
     """
     namelist = zin.namelist()
     name_set = set(namelist)
-    skip_re = re.compile(r'^(?:cover|toc|nav|copy(?:right)?|title(?:page)?|ack(?:nowledg[e]?ments)?|ded(?:ication)?|front|back|halftitle|adcard|next[\-_]?reads)\b', re.I)
+    skip_re = re.compile(
+        r'(?:^|[_\-\.])(?:'
+        r'cov(?:er)?|toc|nav|cop(?:y(?:right)?)?|tp|htp|title(?:page)?|halftitle|'
+        r'ack(?:nowledg[e]?ments)?|ded(?:ication)?|epi(?:graph)?|map|front(?:matter)?|'
+        r'back(?:matter)?|adcard|ata|about|author|bio|next[\-_]?reads|also[\-_]?by|'
+        r'hinweis|copyr|karte|impressum'
+        r')(?:$|[_\-\.\d])',
+        re.I,
+    )
 
     spine_files = []
     opf_files = [n for n in namelist if n.lower().endswith('.opf')]
@@ -376,7 +405,6 @@ def detect_story_chapters(zin: zipfile.ZipFile) -> list:
         opf_dir = PurePosixPath(opf_path).parent
         opf_raw = zin.read(opf_path).decode('utf-8', errors='replace')
 
-        # Map manifest id -> resolved archive path
         id_to_href = {}
         for item_m in re.finditer(r'<item\b([^>]+)>', opf_raw, flags=re.I):
             attrs = item_m.group(1)
@@ -385,7 +413,6 @@ def detect_story_chapters(zin: zipfile.ZipFile) -> list:
             if id_m and href_m:
                 raw_href = href_m.group(1)
                 resolved = str(opf_dir / raw_href) if str(opf_dir) != "." else raw_href
-                # Normalize any ../ segments
                 parts = []
                 for seg in resolved.split('/'):
                     if seg == '..':
@@ -412,7 +439,6 @@ def detect_story_chapters(zin: zipfile.ZipFile) -> list:
         key=natural_sort_key,
     )
 
-    # Filter out obvious non-story files (cover, toc, copyright, acknowledgments)
     story_files = [
         n for n in candidates
         if not skip_re.search(PurePosixPath(n).stem)
@@ -519,8 +545,9 @@ def transform_en_to_progressive_de(
 
             walk_and_transform_html(raw_html, _discover_node)
 
-            # Skip chapters that have practically no story text (e.g. a full-page illustration)
-            if token_cursor[0] < 15 and not valid_counts:
+            # Skip short frontmatter/divider pages (epigraphs, dedications, part titles, quotes)
+            # or copyright/impressum pages
+            if is_front_or_back_matter_html(raw_html) or (token_cursor[0] < 120 and len(chapter_files) > 3) or (token_cursor[0] < 15 and not valid_counts):
                 transformed_files[ch_path] = raw_html.encode('utf-8')
                 continue
 
@@ -619,7 +646,7 @@ def transform_en_to_progressive_de(
                 )
                 vocab_box_html = (
                     f'<div class="bk-vocab-box">'
-                    f'<div class="bk-vocab-title">🇩🇪 Kapitel {ch_idx}: +{len(newly_unlocked)} neue {lvl_label}-Wörter '
+                    f'<div class="bk-vocab-title">🇩🇪 Neues Vokabular: +{len(newly_unlocked)} neue {lvl_label}-Wörter '
                     f'(Gesamt aktiv: {len(unlocked_ids)})</div>'
                     f'<div class="bk-vocab-list">{items_html}</div>'
                     f'</div>'
@@ -705,6 +732,21 @@ def transform_de_to_b1_assisted(
     }
     lower_lookup = {k.lower(): (k, v) for k, v in exact_lookup.items()}
 
+    def _try_stem_lookup(wl_sub: str, orig_word: str):
+        if wl_sub in lower_lookup:
+            canon_de, gloss = lower_lookup[wl_sub]
+            if not is_transparent_cognate(orig_word, gloss):
+                return wl_sub, canon_de, gloss
+        for suf in ('ten', 'tet', 'test', 'te', 'enden', 'ender', 'endes', 'ende', 'end', 'ern', 'en', 'em', 'er', 'es', 'et', 'st', 'e', 'n', 's', 't'):
+            if wl_sub.endswith(suf) and len(wl_sub) - len(suf) >= 4:
+                stem = wl_sub[:-len(suf)]
+                for candidate in (stem, stem + 'en', stem + 'n'):
+                    if candidate in lower_lookup:
+                        canon_de, gloss = lower_lookup[candidate]
+                        if not is_transparent_cognate(orig_word, gloss):
+                            return candidate, canon_de, gloss
+        return None, None, None
+
     def lookup_de_word(word: str):
         if word.lower() in known_words:
             return None, None, None
@@ -714,25 +756,22 @@ def transform_de_to_b1_assisted(
                 return word.lower(), word, gloss
             return None, None, None
         wl = word.lower()
-        if wl in lower_lookup:
-            canon_de, gloss = lower_lookup[wl]
-            if not is_transparent_cognate(word, gloss):
-                return wl, canon_de, gloss
-            return None, None, None
-        for suf in ('en', 'em', 'er', 'es', 'e', 'n', 's'):
-            if wl.endswith(suf) and len(wl) - len(suf) >= 4:
-                stem = wl[:-len(suf)]
-                if stem in lower_lookup:
-                    canon_de, gloss = lower_lookup[stem]
-                    if not is_transparent_cognate(word, gloss):
-                        return stem, canon_de, gloss
-                    return None, None, None
+        k, c_de, g = _try_stem_lookup(wl, word)
+        if g:
+            return k, c_de, g
+        # Try stripping common separable prefixes (e.g. zurückweichen -> weichen, hinabsteigen -> steigen)
+        for pref in ('zurück', 'hervor', 'hinab', 'hinauf', 'hinein', 'hinaus', 'zusammen', 'weiter', 'hinunter', 'herunter', 'heraus', 'herein', 'davon', 'daran', 'ein', 'auf', 'aus', 'ab', 'an', 'zu', 'vor', 'nach'):
+            if wl.startswith(pref) and len(wl) - len(pref) >= 5:
+                sub = wl[len(pref):]
+                k, c_de, g = _try_stem_lookup(sub, word)
+                if g:
+                    return k, c_de, g
         return None, None, None
 
     with zipfile.ZipFile(input_epub, 'r') as zin:
         chapter_files = detect_story_chapters(zin)
 
-        encounter_counts = Counter()
+        encounter_counts = Counter()  # Book-wide frequency for thematic .txt lists
         matched_words_info = {}
         transformed_files = {}
 
@@ -742,6 +781,10 @@ def transform_de_to_b1_assisted(
             raw_html = strip_previous_bilingual_markup(
                 zin.read(ch_path).decode('utf-8', errors='replace')
             )
+            if is_front_or_back_matter_html(raw_html):
+                transformed_files[ch_path] = raw_html.encode('utf-8')
+                continue
+            chapter_counts = Counter()  # Per-chapter fade-out counter so every chapter is richly translated!
             chapter_new_words = []
             chapter_seen_keys = set()
 
@@ -752,11 +795,13 @@ def transform_de_to_b1_assisted(
                     if not gloss:
                         return word
                     encounter_counts[lemma_key] += 1
+                    chapter_counts[lemma_key] += 1
                     if lemma_key not in matched_words_info:
                         matched_words_info[lemma_key] = (canon_de, gloss)
-                    cnt = encounter_counts[lemma_key]
-                    if cnt <= max_hints_per_word:
-                        if cnt == 1 and lemma_key not in chapter_seen_keys and len(chapter_new_words) < 14:
+
+                    # Show inline hint up to `max_hints_per_word` times PER CHAPTER
+                    if chapter_counts[lemma_key] <= max_hints_per_word:
+                        if encounter_counts[lemma_key] == 1 and lemma_key not in chapter_seen_keys and len(chapter_new_words) < 14:
                             chapter_seen_keys.add(lemma_key)
                             chapter_new_words.append((word, gloss))
                         return f'<span class="bk-de-word">{word}</span> <span class="bk-hint">[{gloss}]</span>'
