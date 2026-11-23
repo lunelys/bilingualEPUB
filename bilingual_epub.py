@@ -20,6 +20,7 @@ Key Features & Fixes in v6:
 import zipfile
 import re
 import difflib
+import uuid
 from pathlib import Path, PurePosixPath
 from collections import Counter
 from vocab_data import (
@@ -455,19 +456,106 @@ def is_valid_en_noun_context(word: str, gender: str, prev_w: str) -> bool:
     return True
 
 
-def strip_previous_bilingual_markup(raw_html: str) -> str:
-    """If an already-augmented EPUB is re-converted, removes old vocab boxes and hints cleanly."""
-    if 'class="bk-vocab-box"' not in raw_html and 'class="bk-hint"' not in raw_html:
+def strip_kobo_kepub_wrappers(raw_html: str) -> str:
+    """
+    Removes leftover Kobo store KEPUB wrappers (`koboSpan`, `js/kobo.js`, `css/kobo.css`,
+    `kobostylehacks`) from Kobo-ripped EPUBs so that nested `<span class="bk-hint">`
+    elements never conflict with Kobo's firmware renderer.
+    """
+    if 'koboSpan' not in raw_html and 'kobo.js' not in raw_html and 'kobostylehacks' not in raw_html:
         return raw_html
+
+    cleaned = re.sub(r'<script\b[^>]*kobo\.js[^>]*/>\s*', '', raw_html, flags=re.I)
+    cleaned = re.sub(r'<script\b[^>]*kobo\.js[^>]*>.*?</script>\s*', '', cleaned, flags=re.I | re.S)
+    cleaned = re.sub(r'<link\b[^>]*kobo\.css[^>]*/?>\s*', '', cleaned, flags=re.I)
+    cleaned = re.sub(r'<style\b[^>]*id="kobostylehacks"[^>]*>.*?</style>\s*', '', cleaned, flags=re.I | re.S)
+
+    # Safely unwrap <span ... class="koboSpan" ...>...</span> while preserving all inner content & XML validity
+    if 'koboSpan' in cleaned:
+        parts = TOKEN_SPLIT_RE.split(cleaned)
+        span_stack = []
+        out = []
+        for idx, part in enumerate(parts):
+            if idx % 2 == 1 and part.startswith("<"):
+                if re.match(r'^<span\b', part, flags=re.I) and not part.endswith("/>"):
+                    is_kobo = 'class="koboSpan"' in part or "class='koboSpan'" in part
+                    span_stack.append(is_kobo)
+                    if is_kobo:
+                        continue  # Drop opening koboSpan tag
+                elif re.match(r'^</span\s*>', part, flags=re.I):
+                    if span_stack:
+                        was_kobo = span_stack.pop()
+                        if was_kobo:
+                            continue  # Drop matching closing </span>
+            out.append(part)
+        cleaned = "".join(out)
+
+    return cleaned
+
+
+def strip_previous_bilingual_markup(raw_html: str) -> str:
+    """Strips leftover Kobo KEPUB wrappers and any prior bilingualEPUB markup."""
+    cleaned = strip_kobo_kepub_wrappers(raw_html)
+    if 'class="bk-vocab-box"' not in cleaned and 'class="bk-hint"' not in cleaned:
+        return cleaned
     cleaned = re.sub(
         r'<div class="bk-vocab-box">\s*<div class="bk-vocab-title">.*?</div>\s*<div class="bk-vocab-list">.*?</div>\s*</div>\s*',
         '',
-        raw_html,
+        cleaned,
         flags=re.S,
     )
     cleaned = re.sub(r'\s*<span class="bk-hint">\[[^\]]*\]</span>', '', cleaned)
     cleaned = re.sub(r'<span class="bk-de-word">(.*?)</span>', r'\1', cleaned)
     return cleaned
+
+
+def update_opf_metadata(opf_text: str, title_suffix: str, force_de_lang: bool = False) -> str:
+    """
+    Updates OPF metadata for the generated EPUB:
+    - Optionally sets <dc:language> to 'de' so e-readers use the German dictionary.
+    - Appends title_suffix inside <dc:title> without duplicating it.
+    - Assigns a fresh UUID <dc:identifier> so Kobo never loads a stale cached copy.
+    - Removes leftover Kobo KEPUB manifest items (kobo.js / kobo.css).
+    """
+    if force_de_lang:
+        opf_text = re.sub(
+            r'(<dc:language\b[^>]*>).*?(</dc:language>)',
+            r'\1de\2',
+            opf_text,
+            flags=re.I | re.S,
+        )
+
+    def _append_title(m: re.Match) -> str:
+        open_tag, title_body, close_tag = m.group(1), m.group(2), m.group(3)
+        if title_suffix in title_body:
+            return m.group(0)
+        return f"{open_tag}{title_body} {title_suffix}{close_tag}"
+
+    opf_text = re.sub(
+        r'(<dc:title\b[^>]*>)(.*?)(</dc:title>)',
+        _append_title,
+        opf_text,
+        count=1,
+        flags=re.I | re.S,
+    )
+
+    fresh_uuid = f"urn:uuid:{uuid.uuid4()}"
+    opf_text = re.sub(
+        r'(<dc:identifier\b[^>]*>).*?(</dc:identifier>)',
+        lambda m: f"{m.group(1)}{fresh_uuid}{m.group(2)}",
+        opf_text,
+        count=1,
+        flags=re.I | re.S,
+    )
+
+    # Remove leftover Kobo KEPUB manifest entries if present
+    opf_text = re.sub(
+        r'<item\b[^>]*href="[^"]*(?:kobo\.js|kobo\.css)"[^>]*/?>\s*',
+        '',
+        opf_text,
+        flags=re.I,
+    )
+    return opf_text
 
 
 def transform_en_to_progressive_de(
@@ -664,20 +752,21 @@ def transform_en_to_progressive_de(
         with zipfile.ZipFile(output_epub, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
                 fn = item.filename
+                fn_low = fn.lower()
+                if fn_low.endswith('kobo.js') or fn_low.endswith('kobo.css'):
+                    continue
                 if fn == 'mimetype':
                     zout.writestr(item, zin.read(fn), compress_type=zipfile.ZIP_STORED)
                 elif fn in transformed_files:
                     zout.writestr(item, transformed_files[fn])
-                elif fn.endswith('.opf'):
+                elif fn_low.endswith('.opf'):
                     opf_text = zin.read(fn).decode('utf-8', errors='replace')
-                    opf_text = re.sub(r'<dc:language>.*?</dc:language>', '<dc:language>de</dc:language>', opf_text)
-                    opf_text = re.sub(
-                        r'<dc:title>(.*?)</dc:title>',
-                        r'<dc:title>\1 [Progressive Deutsch]</dc:title>',
-                        opf_text,
-                        count=1
-                    )
+                    opf_text = update_opf_metadata(opf_text, '[Progressive Deutsch]', force_de_lang=True)
                     zout.writestr(item, opf_text.encode('utf-8'))
+                elif fn_low.endswith(('.xhtml', '.html', '.htm')):
+                    raw_other = zin.read(fn).decode('utf-8', errors='replace')
+                    cleaned_other = strip_kobo_kepub_wrappers(raw_other)
+                    zout.writestr(item, cleaned_other.encode('utf-8'))
                 else:
                     zout.writestr(item, zin.read(fn))
 
@@ -844,19 +933,21 @@ def transform_de_to_b1_assisted(
         with zipfile.ZipFile(output_epub, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
                 fn = item.filename
+                fn_low = fn.lower()
+                if fn_low.endswith('kobo.js') or fn_low.endswith('kobo.css'):
+                    continue
                 if fn == 'mimetype':
                     zout.writestr(item, zin.read(fn), compress_type=zipfile.ZIP_STORED)
                 elif fn in transformed_files:
                     zout.writestr(item, transformed_files[fn])
-                elif fn.endswith('.opf'):
+                elif fn_low.endswith('.opf'):
                     opf_text = zin.read(fn).decode('utf-8', errors='replace')
-                    opf_text = re.sub(
-                        r'<dc:title>(.*?)</dc:title>',
-                        f'\\1 [{user_level.upper()}-Assisted]',
-                        opf_text,
-                        count=1
-                    )
+                    opf_text = update_opf_metadata(opf_text, f'[{user_level.upper()}-Assisted]', force_de_lang=False)
                     zout.writestr(item, opf_text.encode('utf-8'))
+                elif fn_low.endswith(('.xhtml', '.html', '.htm')):
+                    raw_other = zin.read(fn).decode('utf-8', errors='replace')
+                    cleaned_other = strip_kobo_kepub_wrappers(raw_other)
+                    zout.writestr(item, cleaned_other.encode('utf-8'))
                 else:
                     zout.writestr(item, zin.read(fn))
 
